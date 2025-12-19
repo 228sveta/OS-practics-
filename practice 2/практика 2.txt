@@ -1,0 +1,328 @@
+#include <windows.h>
+#include <vector>
+#include <string>
+
+using namespace std;
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+
+struct AppState {
+    vector<POINT> figurePixels;
+    POINT position = { 0, 0 };
+    SIZE imageSize = { 0, 0 };
+    COLORREF currentColor = RGB(255, 255, 255);
+    bool dragging = false;
+    POINT dragStart = { 0, 0 };
+    HWND hwnd = NULL;
+    bool needReposition = true;
+};
+
+namespace ImageOps {
+    vector<POINT> ExtractFigure(HBITMAP hbmp, COLORREF* outColor) {
+        vector<POINT> pixels;
+        BITMAP bm;
+        GetObject(hbmp, sizeof(BITMAP), &bm);
+
+        HDC hdc = GetDC(NULL);
+        HDC memdc = CreateCompatibleDC(hdc);
+        SelectObject(memdc, hbmp);
+
+        COLORREF bg = GetPixel(memdc, 0, 0);
+
+        for (int y = 0; y < bm.bmHeight; ++y) {
+            for (int x = 0; x < bm.bmWidth; ++x) {
+                COLORREF clr = GetPixel(memdc, x, y);
+                int diff = abs((int)GetRValue(clr) - (int)GetRValue(bg)) +
+                    abs((int)GetGValue(clr) - (int)GetGValue(bg)) +
+                    abs((int)GetBValue(clr) - (int)GetBValue(bg));
+                if (diff > 60) {
+                    POINT pt;
+                    pt.x = x;
+                    pt.y = y;
+                    pixels.push_back(pt);
+                }
+            }
+        }
+
+        if (!pixels.empty() && outColor) {
+            *outColor = GetPixel(memdc, pixels[pixels.size() / 3].x,
+                pixels[pixels.size() / 3].y);
+        }
+
+        DeleteDC(memdc);
+        ReleaseDC(NULL, hdc);
+        return pixels;
+    }
+}
+
+namespace UIOps {
+    void DrawFigure(HDC hdc, const AppState& state) {
+        for (const auto& pt : state.figurePixels) {
+            SetPixel(hdc, state.position.x + pt.x,
+                state.position.y + pt.y,
+                state.currentColor);
+        }
+    }
+
+    void DrawNameText(HDC hdc, const AppState& state) {
+        if (state.figurePixels.empty()) return;
+
+        int centerX = state.position.x + state.imageSize.cx / 2;
+        int centerY = state.position.y + state.imageSize.cy / 2;
+
+        HFONT hFont = CreateFontW(
+            24,
+            0,
+            0,
+            0,
+            FW_BOLD,
+            FALSE,
+            FALSE,
+            FALSE,
+            RUSSIAN_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY,
+            DEFAULT_PITCH | FF_DONTCARE,
+            L"Arial"
+        );
+
+        HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+
+        int brightness = (GetRValue(state.currentColor) * 299 +
+            GetGValue(state.currentColor) * 587 +
+            GetBValue(state.currentColor) * 114) / 1000;
+
+        COLORREF textColor = (brightness > 128) ? RGB(0, 0, 0) : RGB(255, 255, 255);
+
+        SetTextColor(hdc, textColor);
+        SetBkMode(hdc, TRANSPARENT);
+
+        wstring name = L"Светлана Матеренко";
+        RECT textRect;
+        textRect.left = centerX - 150;
+        textRect.top = centerY - 15;
+        textRect.right = centerX + 150;
+        textRect.bottom = centerY + 15;
+
+        DrawTextW(hdc, name.c_str(), -1, &textRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        SelectObject(hdc, hOldFont);
+        DeleteObject(hFont);
+    }
+
+    void UpdateColor(AppState& state) {
+        static int colorIndex = 0;
+        COLORREF colors[] = {
+            RGB(255, 99, 71),
+            RGB(64, 224, 208),
+            RGB(218, 112, 214),
+            RGB(50, 205, 50),
+            RGB(255, 165, 0),
+            RGB(147, 112, 219)
+        };
+        state.currentColor = colors[colorIndex];
+        colorIndex = (colorIndex + 1) % 6;
+    }
+
+    bool IsPointInFigure(const AppState& state, POINT pt) {
+        for (const auto& pixel : state.figurePixels) {
+            if (state.position.x + pixel.x == pt.x &&
+                state.position.y + pixel.y == pt.y) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+void HandleFileOpen(AppState& state) {
+    wchar_t path[MAX_PATH] = { 0 };
+    OPENFILENAMEW ofn = { sizeof(ofn) };
+    ofn.hwndOwner = state.hwnd;
+    ofn.lpstrFilter = L"Images\0*.bmp;*.jpg;*.png\0";
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+    if (GetOpenFileNameW(&ofn)) {
+        HBITMAP hbmp = (HBITMAP)LoadImageW(
+            NULL,
+            path,
+            IMAGE_BITMAP,
+            0,
+            0,
+            LR_LOADFROMFILE
+        );
+        if (hbmp) {
+            state.figurePixels = ImageOps::ExtractFigure(hbmp, &state.currentColor);
+            BITMAP bm;
+            GetObject(hbmp, sizeof(BITMAP), &bm);
+            state.imageSize.cx = bm.bmWidth;
+            state.imageSize.cy = bm.bmHeight;
+            DeleteObject(hbmp);
+            state.needReposition = true;
+        }
+    }
+}
+
+void PositionFigure(AppState& state) {
+    if (!state.hwnd) return;
+
+    RECT rc;
+    GetClientRect(state.hwnd, &rc);
+
+    state.position.x = (rc.right - state.imageSize.cx) / 2;
+    state.position.y = 50;
+
+    if (state.position.x < 0) state.position.x = 0;
+    if (state.position.y < 0) state.position.y = 0;
+
+    state.needReposition = false;
+}
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    static AppState appState;
+
+    switch (msg) {
+    case WM_CREATE:
+        appState.hwnd = hwnd;
+        HandleFileOpen(appState);
+        break;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+
+        if (appState.needReposition && !appState.figurePixels.empty()) {
+            PositionFigure(appState);
+        }
+
+        HDC memdc = CreateCompatibleDC(hdc);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        SelectObject(memdc, bmp);
+
+        FillRect(memdc, &rc, (HBRUSH)(COLOR_WINDOW + 1));
+
+        if (!appState.figurePixels.empty()) {
+            UIOps::DrawFigure(memdc, appState);
+            UIOps::DrawNameText(memdc, appState);
+        }
+
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, memdc, 0, 0, SRCCOPY);
+
+        DeleteObject(bmp);
+        DeleteDC(memdc);
+        EndPaint(hwnd, &ps);
+        break;
+    }
+
+    case WM_LBUTTONDOWN: {
+        POINT pt;
+        pt.x = LOWORD(lp);
+        pt.y = HIWORD(lp);
+        if (!appState.figurePixels.empty() && UIOps::IsPointInFigure(appState, pt)) {
+            appState.dragging = true;
+            appState.dragStart = pt;
+            SetCapture(hwnd);
+        }
+        break;
+    }
+
+    case WM_RBUTTONDOWN: {
+        POINT pt;
+        pt.x = LOWORD(lp);
+        pt.y = HIWORD(lp);
+        if (!appState.figurePixels.empty() && UIOps::IsPointInFigure(appState, pt)) {
+            UIOps::UpdateColor(appState);
+            InvalidateRect(hwnd, NULL, TRUE);
+        }
+        break;
+    }
+
+    case WM_MOUSEMOVE:
+        if (appState.dragging) {
+            POINT pt;
+            pt.x = LOWORD(lp);
+            pt.y = HIWORD(lp);
+            appState.position.x += pt.x - appState.dragStart.x;
+            appState.position.y += pt.y - appState.dragStart.y;
+            appState.dragStart = pt;
+            InvalidateRect(hwnd, NULL, TRUE);
+        }
+        break;
+
+    case WM_LBUTTONUP:
+        appState.dragging = false;
+        ReleaseCapture();
+        break;
+
+    case WM_SIZE:
+        if (!appState.dragging && appState.figurePixels.size() > 0) {
+            appState.needReposition = true;
+        }
+        InvalidateRect(hwnd, NULL, TRUE);
+        break;
+
+    case WM_KEYDOWN:
+        if (wp == VK_F5) {
+            HandleFileOpen(appState);
+            InvalidateRect(hwnd, NULL, TRUE);
+        }
+        break;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+    }
+
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    const wchar_t CLASS_NAME[] = L"ImageShapeViewer";
+
+    WNDCLASSW wc = { 0 };
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+
+    RegisterClassW(&wc);
+
+    HWND hwnd = CreateWindowExW(
+        0,
+        CLASS_NAME,
+        L"Просмотр фигур - Светлана Матеренко",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        800,
+        600,
+        NULL,
+        NULL,
+        hInstance,
+        NULL
+    );
+
+    if (!hwnd) {
+        return 0;
+    }
+
+    ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
+
+    MSG msg = { 0 };
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    return (int)msg.wParam;
+}
